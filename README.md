@@ -4,7 +4,48 @@ pSAM will calculate the similarity of every pixel in a high-plex image to a pre-
 
 Within your dataset folder, you need to create a csv file that has all desired references. The first column of this file should be 'Marker', and contain all markers used to generate your references. All other columns will be the names for each reference pseudospectrum. For each marker, define an expected value ranging from 0-1 for each marker in your dataset (or each marker selected for the desired classifications).
 
+## Database structure
+The database should have the following structure:
+> Dataset
+>> reference_spectra.csv # pseudospectra refs
+>> Corrected_DAPI_composites # DAPI images
+>>> DAPIImage0
+>>> ...
+>>> DAPIImageX
+>>> 
+>> Normalized_composites #folder with all other image channels
+>>> Sample1
+>>>> Area1
+>>>>> ImageChannel0
+>>>>> ...
+>>>>> ImageChannelN
+>>>>> 
+>> tissue_composite_masks_instance # tissue section or TMA core instance segmentations
+>>> DAPIImage1
+>>> ...
+>>> DAPIImageX
+
+## File naming
+Image filenames should follow the convention:
+
+target or marker _ wavelength or fluorophore _ cycleNumber _ dataset _ sampleID _ ROIid .tif
+
+For example:
+DAPI_UV_1_BC_120623S1_Area1.tif
+
+CD4_AF647_9_BC_120623S1_Area1.tif
+
+
 ## Scripts:
+
+### batch_pSAM.sh: 
+runs all of the following scripts in order
+
+Inputs: dataset, sample, area, root directory, pixel size (microns), pad for nucleus dilation (microns)
+
+Requires: reference_spectra.csv, contents of 'Normalized_composites' folder, masks in 'tissue_composite_masks_instance' folder
+
+Outputs/Creats: see scripts below
 
 ### spectral_angle_mapping.py: 
 computes the cosine similarity to all references in 'reference_spectra.csv' for all pixels in the specified image(s).
@@ -105,42 +146,6 @@ Requires: filtered csv from analysis script
 
 Outputs/Creates: full-size and downsampled RGB visualizations of cell classes in 'Composite_predictions-withSAMclass'
 
-### batch_pSAM.sh: 
-runs all of the above scripts in order
 
-Inputs: dataset sample area
 
-Requires: reference_spectra.csv, contents of 'Normalized_composites' folder, masks in 'tissue_composite_masks_instance' folder
-
-Outputs/Creats: see scripts above
-
-## Database structure
-The database should have the following structure:
-> Dataset
->> reference_spectra.csv # pseudospectra refs
->> Corrected_DAPI_composites # DAPI images
->>> DAPIImage0
->>> ...
->>> DAPIImageX
->>> 
->> Normalized_composites #folder with all other image channels
->>> Sample1
->>>> Area1
->>>>> ImageChannel0
->>>>> ...
->>>>> ImageChannelN
->>>>> 
->> tissue_composite_masks_instance # tissue section or TMA core instance segmentations
->>> DAPIImage1
->>> ...
->>> DAPIImageX
-
-## File naming
-Image filenames should follow the convention:
-target or marker _ wavelength or fluorophore _ cycleNumber _ dataset _ sampleID _ ROIid .tif
-
-For example:
-DAPI_UV_1_BC_120623S1_Area1.tif
-
-CD4_AF647_9_BC_120623S1_Area1.tif
 
