@@ -4,7 +4,7 @@ pSAM will calculate the similarity of every pixel in a high-plex image to a pre-
 
 Within your dataset folder, you need to create a csv file that has all desired references. The first column of this file should be 'Marker', and contain all markers used to generate your references. All other columns will be the names for each reference pseudospectrum. For each marker, define an expected value ranging from 0-1 for each marker in your dataset (or each marker selected for the desired classifications).
 
-Scripts:
+## Scripts:
 
 spectral_angle_mapping.py: computes the cosine similarity to all references in 'reference_spectra.csv' for all pixels in the specified image(s).
 Inputs: --dataset --sample --area --rootdir
@@ -21,15 +21,15 @@ Inputs: --dataset --sample --area --rootdir --pxsz (pixel size in microns)
 Requires: cell nucleus and whole cell instance segmentations of full image/slide stored in: nucleus_segmentations_WS and wholeCell_segmentations_WS (stored as dictionary in .npy format with label matrix of segmentations under 'masks' key), full tissue segmentation stored in 'tissue_composite_masks' and output of spectral_angle_mapping.py
 Outputs/Creates: classify_by_dilation folder
 
-get_cell_MPI_csv.py: calculates cell MPI for all cells in segmentations
+get_cell_MPI_NucMem_csv_eff.py: calculates cell MPI for all cells in segmentations; includes MPI for membrane and nucleus compartments and weighted MPI using blurred masks for whole cell (wc), membrane (mem), and nucleus (nuc) compartments
 Inputs: --dataset --sample --area --rootdir
 Requires: contents of Normalized_composites folder, whole cell segmentations stored at full-slide/full-image in wholeCell_segmentations_WS
 Outputs/Creates: cell MPI csv in classify_by_dilation folder
 
-merge_class_and_MPI_csvs.py: combines pSAM cell class and cell MPI based on cell id from segmentations
+cellMPI_merge_sections.py: combines features from cells in large samples back into one file and adjusts CellIDs to reflect a single section of tissue; unique cellIDs per section are now under 'AdjCellID'
 Inputs: --dataset --sample --area --rootdir
-Requires: cell MPI csv and cell class csv from MPI and match scripts
-Outputs/Creates: combined csv file in classify_by_dilation/with-MPI
+Requires: cell MPI csv 
+Outputs/Creates: combined csv file in classify_by_dilation
 
 SAM_analysis_plots-general.py: filters combined csv from previous script to classify any cells with score=0 as unclassified, generates prevalence plots and z-score MPI validation plot
 Inputs: --dataset --sample --area --rootdir
@@ -45,3 +45,31 @@ batch_pSAM.sh: runs all of the above scripts in order
 Inputs: dataset sample area
 Requires: reference_spectra.csv, contents of 'Normalized_composites' folder, nucleus and whole cell segmentations in 'nucleus_segmentations_WS' and wholeCell_segmentations_WS', full-tissue masks in 'tissue_composite_masks' folder
 Outputs/Creats: all files above
+
+## Database structure
+The database should have the following structure:
+> Dataset
+>> reference_spectra.csv #file with expected marker expression in cell classes
+>> Corrected_DAPI_composites #folder with DAPI images for cell segmentation
+>>> DAPIImage1
+>>> ...
+>>> DAPIImageX
+>> Normalized_composites #folder with all other image channels
+>>> Sample1
+>>>> Area1
+>>>>> Image1
+>>>>> ...
+>>>>> ImageN
+>>>> ...
+>>>> AreaM
+>>> ...
+>>> SampleK
+
+## File naming
+Image filenames should follow the convention:
+<target or marker> _ <wavelength or fluorophore> _ <cycleNum> _ <dataset> _ <sampleID> _ <ROIid> .tif
+
+For example:
+DAPI_UV_1_BC_120623S1_Area1.tif
+CD4_AF647_9_BC_120623S1_Area1.tif
+
