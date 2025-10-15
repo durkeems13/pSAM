@@ -8,6 +8,7 @@ Within your dataset folder, you need to create a csv file that has all desired r
 The database should have the following structure:
 > Dataset
 >> reference_spectra.csv # pseudospectra refs
+>> 
 >> Corrected_DAPI_composites # DAPI images
 >>> DAPIImage0
 >>> ...
