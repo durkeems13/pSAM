@@ -28,17 +28,23 @@ def calc_sim_to_ref(batches):
         stains = list(stains)
         cols = [x for x in cols if x!='Marker']
         reference_spectra = reference_spectra[cols]
+
+        dapiname = [x for x in dapis if (sample in x) and (area in x)]
+        if len(dapiname)==0:
+            continue
         
         skip_batch=0
-        comp_done=0
+        comps_done=[]
         for col in cols:
             if os.path.exists(os.path.join(save_dir,sample,area,'_'.join([sample,area,col,'similarity.tif']))):
-                comp_done=1
+                comps_done.append(col)
             if os.path.exists(os.path.join(save_dir,sample,area,'_'.join([sample,area,col,str(batchnum),'similarity.tif']))):
                 skip_batch+=1
         if skip_batch==len(cols):
             continue
-        if comp_done==1:
+
+        cols = list(set(cols)-set(comps_done))
+        if len(cols)==0:
             continue
         
         print('')
@@ -55,33 +61,28 @@ def calc_sim_to_ref(batches):
             new_comps=[]
             for stain in stains:
                 new_comp = [x for x in comps if x.split('_')[0]==stain]
-                new_comps.append(new_comp[0])
+                if len(new_comp)==1:
+                    new_comps.append(new_comp[0])
+                else:
+                    new_comps.append('ZERO_MAT')
 
             imstack = np.zeros([r,c,len(stains)])
             for i,comp in tqdm(enumerate(new_comps)):
-                img = imread(os.path.join(read_dir,sample,area,comp))
-                tim = [x for x in masks if (sample in x) and (area in x)]
-                timg = imread(os.path.join(mask_dir,tim[0]))
-                bkgd = img[timg==0]
-                m =  np.mean(bkgd)
-                del timg,tim,bkgd
-                '''
-                vals = img.flatten()
-                vals.sort()
-                if ('pSTAT' in comp) or ('Foxp3' in comp):
-                    th=0.9999
+                if comp == 'ZERO_MAT':
+                    img = np.zeros([maxR-minR,maxC-minC])
+                    imstack[:,:,i]=img
                 else:
-                    th=0.99
-                idx = int(th*len(vals))
-                iM = vals[idx]
-                '''
-                iM=np.max(img,axis=None)
-                img = np.clip(img,m,iM)
-                img = img/iM
-                imstack[:,:,i]=img[minR:maxR,minC:maxC]
+                    img = imread(os.path.join(read_dir,sample,area,comp))
+                    tim = [x for x in masks if (sample in x) and (area in x)]
+                    timg = imread(os.path.join(mask_dir,tim[0]))
+                    bkgd = img[timg==0]
+                    m =  np.mean(bkgd)
+                    del timg,tim,bkgd
+                    iM=np.max(img,axis=None)
+                    img = np.clip(img,m,iM)
+                    img = img/iM
+                    imstack[:,:,i]=img[minR:maxR,minC:maxC]
             if 'DAPI' in stains:
-                dapiname = [x for x in dapis if sample in x]
-                dapiname = [x for x in dapiname if area in x]
                 dapi = imread(os.path.join(dapi_dir,dapiname[0]))
                 vals = dapi.flatten()
                 vals.sort()
@@ -90,11 +91,16 @@ def calc_sim_to_ref(batches):
                 dapi=np.clip(dapi,0,dM)
                 dapi=dapi/dM
                 dloc = stains.index('DAPI')
-                imstack[:,:,dloc]=dapi[minR:maxR,minC:maxC]
+                try:
+                    imstack[:,:,dloc]=dapi[minR:maxR,minC:maxC]
+                except:
+                    imstack[:,:-1,dloc]=dapi[minR:maxR,minC:maxC]
             
             imwrite(os.path.join(save_dir,sample,area,'_'.join([sample,area,str(batchnum),'compstack.tif'])),(255*imstack).astype(np.uint8))
         print('')
         print('Computing SAM maps...')
+        locs = np.isnan(imstack)
+        imstack[locs]=0
         for ii,ref in tqdm(enumerate(cols)):
             if os.path.exists(os.path.join(save_dir,sample,area,'_'.join([sample,area,ref,str(batchnum),'similarity.tif']))):
                 continue
@@ -107,10 +113,10 @@ def calc_sim_to_ref(batches):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rootdir",type=str,default='/nfs/kitbag/CellularImageAnalysis/SCAMPI_datasets',help="")
-    parser.add_argument("--dataset",type=str,default='PSC_CRC',help='')
+    parser.add_argument("--dataset",type=str,default='BC_CODEX',help='')
     parser.add_argument("--read",type=str,default='Normalized_composites',help="")
     parser.add_argument("--dapi",type=str,default='Corrected_DAPI_composites',help="")
-    parser.add_argument("--mask",type=str,default='tissue_composite_masks',help="")
+    parser.add_argument("--mask",type=str,default='tissue_composite_masks_instance',help="")
     parser.add_argument("--save",type=str,default='spectral_angle_mapping',help="")
     parser.add_argument("--sample",type=str,default='all_samples',help="")
     parser.add_argument("--area",type=str,default='all_areas',help="")
@@ -141,8 +147,9 @@ def main():
     
     compdicts = []
     loc_dict={}
-    samples = [x for x in samples if 'S15' not in x]
     for sample in samples:
+        if 'TMA' in sample:
+            continue
         if args.sample!='all_samples':
             if sample != args.sample:
                 continue
@@ -156,6 +163,7 @@ def main():
             if not os.path.exists(os.path.join(save_dir,sample,area)):
                 os.makedirs(os.path.join(save_dir,sample,area))
             ims = os.listdir(os.path.join(read_dir,sample,area))
+                   
             img = imread(os.path.join(read_dir,sample,area,ims[0]))
             r,c = np.shape(img)
             locdict={'Size':[r,c]}
@@ -180,15 +188,16 @@ def main():
             compdicts.extend(newdicts)
             loc_dict.update({sample+'_'+area:locdict})
     
-    if len(compdicts)<=100:
+    if len(compdicts)<=50:
         num_workers = len(compdicts)
     else:
-        num_workers = 100
-    batchsize=int(np.ceil(len(compdicts)/100))
+        num_workers=50
+    batchsize=int(np.ceil(len(compdicts)/50))
     batches = []
     for i in range(num_workers):
         batch = compdicts[i*batchsize:(i+1)*batchsize]
         batches.append(batch)
+    
     pool = mp.Pool(num_workers)
     print('')
     print(num_workers)
@@ -222,20 +231,18 @@ def main():
                 if os.path.exists(os.path.join(save_dir,sample,area,newname)):
                     if len(patches)==0:
                         continue
-                    '''
                     else:
                         [os.remove(os.path.join(save_dir,sample,area,x)) for x in patches]
                         continue
-                    '''
                 full_map = np.zeros([r,c])
-
+                
+                keep=0
                 for patch in patches:
                     bnum = patch.split('_')[-2]
                     try:
                         rmin,rmax,cmin,cmax = loc_dict[sample+'_'+area][bnum]
                         tmp = imread(os.path.join(save_dir,sample,area,patch))
                         full_map[rmin:rmax,cmin:cmax]=tmp
-                        keep = 0
                     except:
                         keep=1 
                         break

@@ -7,10 +7,12 @@ Created on Tue May 30 18:49:49 2023
 """
 import os
 import argparse
+import re
 import pandas as pd
 import numpy as np
 from skimage.filters import threshold_otsu,threshold_multiotsu
 import matplotlib.pyplot as plt
+from typing import Iterable, List, Dict, Optional, Tuple
 
 def hex_to_rgb(hex):
   return tuple(int(hex[i:i+2], 16) for i in (0, 2, 4))
@@ -18,10 +20,10 @@ def hex_to_rgb(hex):
 def rgb_to_hex(rgb):
   return '#{:02x}{:02x}{:02x}'.format(rgb[0],rgb[1],rgb[2])
 
-def filter_cells(df):
+def filter_cells(df,mth,nth):
     cats = [x for x in df.columns if 'Int-mean' not in x]
     cats = [x for x in cats if 'Centroid' not in x]
-    cats = [x for x in cats if x not in ['Sample','Area','CellID','CompName']]
+    cats = [x for x in cats if x not in ['Sample','Area','CellID','CompName','Section']]
     cats = [x for x in cats if 'Unnamed' not in x]
     cats = [x for x in cats if 'Cat' not in x]
     memcats = [x for x in cats if 'Nuc' not in x]
@@ -32,415 +34,568 @@ def filter_cells(df):
     nuccatname = list(df[nuccats].idxmax(axis=1))
     memcat = [memcats.index(x) for x in memcatname]
     nuccat = [nuccats.index(x) for x in nuccatname]
-    memcatname = [x if memmax[i]>0 else 'unclassified' for i,x in enumerate(memcatname)] #0
-    nuccatname = [x if nucmax[i]>0 else 'Nucleus' for i,x in enumerate(nuccatname)] #0
+    memcatname = [x if memmax[i]>mth else 'unclassified' for i,x in enumerate(memcatname)] #0
+    nuccatname = [x if nucmax[i]>nth else 'Nucleus' for i,x in enumerate(nuccatname)] #0
+    nuccatname = ['Nucleus' if x=='Generic-Nucleus' else x for x in nuccatname]
+    finalcatname = [x+'_'+y if y!='Nucleus' else x for x,y in zip(memcatname,nuccatname)]
+    finalcatscore = [np.mean([x,y]) for x,y in zip(memmax,nucmax)]
+
     df['MemCat']=memcat
     df['NucCat']=nuccat
     df['MemCatName']=memcatname
     df['NucCatName']=nuccatname
     df['MemCatScore']=memmax
     df['NucCatScore']=nucmax
+    df['FinalCatName']=finalcatname
+    df['FinalCatScore']=finalcatscore
 
-    return df    
+    return df
+
+def fix_split_sections(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Expects columns: CompName, Section, CellID
+    Returns a copy with new columns: FullSection, AdjCellID
+    """
+    out = df.copy()
+
+    # Base section name with any single trailing 'a' or 'b' removed (seg1a -> seg1; seg2 -> seg2)
+    out['BaseSection'] = out['Section'].astype(str).str.replace(r'[ab]$', '', regex=True)
+
+    # FullSection = CompName + '_' + BaseSection
+    out['FullSection'] = out['CompName'].astype(str) + '_' + out['BaseSection']
+
+    # Identify split halves
+    is_a = out['Section'].astype(str).str.endswith('a')
+    is_b = out['Section'].astype(str).str.endswith('b')
+
+    # For each (CompName, BaseSection), find the max CellID in the 'a' half, then add 1 for a safe offset
+    key = ['CompName', 'BaseSection']
+    offset_series = (
+        out.loc[is_a]
+        .groupby(key)['CellID']
+        .max()
+        .add(1)  # +1 so AdjCellIDs are unique across a/b without colliding at the boundary
+        .rename('offset')
+    )
+
+    # Map offsets onto all rows (NaN -> 0 for non-split or missing 'a')
+    out = out.merge(offset_series, how='left', left_on=key, right_index=True)
+    out['offset'] = out['offset'].fillna(0).astype(int)
+
+    # Adjust only the 'b' rows; 'a' and unsplit sections remain unchanged
+    out['AdjCellID'] = out['CellID'] + np.where(is_b, out['offset'], 0)
+    out['AdjCellID'] = out['AdjCellID'].astype(int)
+
+    # Clean up helpers if you like
+    out.drop(columns=['BaseSection', 'offset'], inplace=True)
+
+    return out
+
+def plot_mpi_by_class(
+    df: pd.DataFrame,
+    sdir: str,
+    memname_dict: dict | None = None,
+    nucname_dict: dict | None = None,
+):
+    """
+    Builds mean-intensity and z-score heatmaps per predicted class.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Must include columns:
+          - 'MemCatName', 'NucCatName'
+          - intensity columns like '*Int-mean_wc*'
+    sdir : str
+        Output directory for PNGs.
+    cols : list[str]
+        Candidate column names to filter from.
+    memname_dict : dict
+        Optional pretty-name mapping for membrane classes.
+    nucname_dict : dict
+        Optional pretty-name mapping for nucleus classes.
+    """
+
+    os.makedirs(sdir, exist_ok=True)
+
+    # ---- categories (preserve np.unique ordering) ----
+    memcats = np.unique(df['MemCatName'].to_numpy())
+    nuccats = np.unique(df['NucCatName'].to_numpy())
+
+    # ---- select marker-intensity columns ----
+    mpicols = [c for c in df.columns if ('Int-mean_wcw' in c) and ('TAF' not in c) and ('DIC' not in c)]
+    mpicols = [c for c in mpicols if 'BCDA2' not in c]
+    mpicols.sort()
+    mpidf = df[mpicols]
+
+    # ---- z-score (column-wise) without modifying df ----
+    col_means = mpidf.mean(axis=0)
+    col_stds = mpidf.std(axis=0).replace(0, np.nan)  # avoid divide-by-zero -> NaN z (will average to NaN)
+    zdf = (mpidf - col_means) / col_stds
+
+    # ---- group means by class (vectorized) ----
+    # means of raw intensities
+    mu_mem = df.groupby('MemCatName', sort=False)[mpicols].mean().reindex(memcats)
+    mu_nuc = df.groupby('NucCatName', sort=False)[mpicols].mean().reindex(nuccats)
+    mu_array = np.vstack([mu_mem.to_numpy(), mu_nuc.to_numpy()])
+
+    # means of z-scores (align with df index first)
+    zdf_aligned = zdf.set_index(df.index)
+    z_mem = zdf_aligned.groupby(df['MemCatName'], sort=False).mean().reindex(memcats)
+    z_nuc = zdf_aligned.groupby(df['NucCatName'], sort=False).mean().reindex(nuccats)
+    z_array = np.vstack([z_mem.to_numpy(), z_nuc.to_numpy()])
+
+    # ---- labels ----
+    # friendly class names if dicts provided; fall back to originals
+    memname_dict = memname_dict or {}
+    nucname_dict = nucname_dict or {}
+    # maintain your special-case tweak
+    nucname_dict = {**nucname_dict, 'GenericNucleus': 'Generic-Nucleus'}
+
+    cats = [memname_dict.get(x, x) for x in memcats] + [nucname_dict.get(x, x) for x in nuccats]
+
+    # marker names
+    markers = [c.split('_Int')[0] for c in mpicols]
+    markers = [m.replace('gamma', '\u03B3').replace('delta', '\u03B4') for m in markers]
+
+    # ---- plot 1: means ----
+    plt.figure(figsize=(4, 4), dpi=600)
+    plt.imshow(mu_array, cmap='jet', aspect='auto')
+    plt.yticks(ticks=np.arange(len(cats)), labels=cats, fontsize=5)
+    plt.xticks(ticks=np.arange(len(mpicols)), labels=markers, rotation=90, fontsize=5)
+    plt.colorbar()
+    plt.xlabel('Marker', fontsize=8)
+    plt.ylabel('Predicted Cell Class', fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(sdir, 'MeanMPI-perClass.png'), dpi=600)
+    plt.close()
+
+    # ---- plot 2: z-scores (clamped -1..1 like before) ----
+    plt.figure(figsize=(6.5, 4.5), dpi=600)
+    plt.imshow(z_array, vmin=-1, vmax=1, cmap='seismic', aspect='auto')
+    plt.yticks(ticks=np.arange(len(cats)), labels=cats, fontsize=8)
+    plt.xticks(ticks=np.arange(len(mpicols)), labels=markers, rotation=90, fontsize=8)
+    plt.colorbar()
+    plt.xlabel('Marker', fontsize=11)
+    plt.ylabel('Predicted Cell or Nucleus Class', fontsize=11)
+    plt.tight_layout()
+    plt.savefig(os.path.join(sdir, 'MeanMPIzscore-perClass.png'), dpi=600)
+    plt.close()
+
+def _ordered_unique(seq: Iterable[str]) -> List[str]:
+    """Stable unique preserving first occurrence."""
+    seen = set()
+    out = []
+    for x in seq:
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
+
+
+def anonymize_compnames(
+    comp_series: pd.Series,
+    sep: str = "_",
+    area_from: str = "Area",
+    area_to: str = "A",
+) -> Tuple[pd.Series, Dict[str, str]]:
+    """
+    Anonymize CompName by mapping the *prefix* (before sep) to S1, S2, ...
+    and replacing 'Area' with 'A' in the final strings (to match your behavior).
+    Returns the anonymized series and the mapping dict {orig_prefix: 'S#'}.
+    """
+    comp_series = comp_series.astype(str)
+    prefixes = comp_series.str.split(sep, n=1, expand=True)[0]
+    uniq_prefixes = _ordered_unique(prefixes.tolist())
+    prefix_map = {p: f"S{i+1}" for i, p in enumerate(uniq_prefixes)}
+
+    # Replace only the prefix occurrence at start-of-string
+    anon = comp_series.copy()
+    for orig, anonp in prefix_map.items():
+        anon = anon.str.replace(rf"^{re.escape(orig)}", anonp, regex=True)
+
+    # Area -> A, like your original
+    anon = anon.str.replace(area_from, area_to, regex=False)
+    return anon, prefix_map
+
+
+def anonymize_ids(series: pd.Series, label_prefix: str = "S") -> Tuple[pd.Series, Dict[str, str]]:
+    """
+    One-to-one anonymization of IDs (e.g., AccNum) to S1..SN in first-seen order.
+    Returns the anonymized series and {orig: 'S#'} mapping.
+    """
+    series = series.astype(str)
+    uniques = _ordered_unique(series.tolist())
+    id_map = {u: f"{label_prefix}{i+1}" for i, u in enumerate(uniques)}
+    return series.map(id_map), id_map
+
+
+def compute_category_proportions(
+    df: pd.DataFrame,
+    group_col: str,
+    category_col: str,
+    ordered_cats: Iterable[str],
+) -> pd.DataFrame:
+    """
+    Vectorized per-group proportions of category_col. Missing cats -> 0.
+    Output columns are intersect(ordered_cats, observed) in that order.
+    """
+    vc = (
+        df.groupby(group_col)[category_col]
+          .value_counts(normalize=True)
+          .unstack(fill_value=0.0)
+    )
+    # Keep only requested cats that appear; ensure stable requested order
+    keep_cols = [c for c in ordered_cats if c in vc.columns]
+    return vc.reindex(columns=keep_cols)
+
+
+def resolve_colors_in_order(
+    color_dict: Dict[str, Iterable[float]],
+    ordered_cats: Iterable[str],
+) -> List[str]:
+    """Return a hex color list parallel to ordered_cats (skipping cats not found)."""
+    cols = []
+    for cat in ordered_cats:
+        if cat in color_dict:
+            cols.append(rgb_to_hex(color_dict[cat]))
+    return cols
+
+
+def plot_stacked_bar(
+    prop_df: pd.DataFrame,
+    xlabels: Optional[List[str]],
+    outfile: str,
+    title: Optional[str] = None,
+    legend: bool = False,
+    xlabel: str = "",
+    ylabel: str = "Proportion of Cells",
+    tick_fontsize: int = 11,
+    ylabel_fontsize: int = 12,
+    xlabel_fontsize: int = 12,
+    width: float = 0.9,
+    dpi: int = 600,
+):
+    """
+    Plot a stacked bar from a proportions DataFrame (index = groups, columns = categories).
+    """
+    plt.figure(figsize=(6.5, 4.5), dpi=dpi)
+    # Pandas plot wants colors via prop_df.plot(..., color=[...])
+    ax = prop_df.plot(
+        kind="bar",
+        stacked=True,
+        width=width,
+        color=None,   # set through ax containers later (keeps function generic)
+        legend=legend,
+        ax=plt.gca(),
+        rot=0,
+    )
+
+    # Optional relabeling of x-axis (e.g., anonymized labels)
+    if xlabels is not None:
+        ax.set_xticklabels(xlabels, rotation=90, fontsize=tick_fontsize)
+    else:
+        ax.tick_params(axis="x", labelsize=tick_fontsize, rotation=90)
+
+    # Y axis formatting
+    ax.set_yticks([0.0, 0.5, 1.0])
+    ax.tick_params(axis="y", labelsize=tick_fontsize)
+
+    # Labels & title
+    ax.set_xlabel(xlabel, fontsize=xlabel_fontsize)
+    ax.set_ylabel(ylabel, fontsize=ylabel_fontsize)
+    if title:
+        ax.set_title(title)
+
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=dpi)
+    plt.close()
+
+
+def set_bar_colors(ax: plt.Axes, hex_colors: List[str]):
+    """
+    Assign a color per category stack using the plotting order of bar containers.
+    Assumes len(hex_colors) == number of category columns in the plotted DataFrame.
+    """
+    containers = [c for c in ax.containers if hasattr(c, "datavalues")]
+    for cont, color in zip(containers, hex_colors):
+        for patch in cont.patches:
+            patch.set_facecolor(color)
+
+
+def load_nucleus_color_dict(npy_path: str) -> Dict[str, Iterable[float]]:
+    """
+    Load color_dictionary.npy and filter to nucleus entries.
+    Rename 'Nucleus' -> 'Generic-Nucleus' (your convention).
+    """
+    if not os.path.exists(npy_path):
+        raise FileNotFoundError(f"Color dictionary not found: {npy_path}")
+
+    cdict = np.load(npy_path, allow_pickle=True).item()
+    nuc_names = [k for k in cdict.keys() if "Nucleus" in k or k == "Nucleus"]
+    out = {}
+    for name in nuc_names:
+        new_name = "Generic-Nucleus" if name == "Nucleus" else name
+        out[new_name] = cdict[name]
+    return out
+
+
+def make_prevalence_plots(
+    df: pd.DataFrame,
+    sdir: str,
+    csvname: str,
+    memcolor_dict: Dict[str, Iterable[float]],
+    mem_cat_col: str = "MemCatName",
+    nuc_cat_col: str = "NucCatName",
+    comp_col: str = "CompName",
+    acc_col: str = "AccNum",
+    color_dict_npy: Optional[str] = None,  # e.g., os.path.join(root,dataset,'color_dictionary.npy')
+    order_dict_npy: Optional[str] = None,  # e.g., os.path.join(root,dataset,'color_dictionary.npy')
+):
+    """
+    Generates four stacked-bar prevalence plots (membrane & nucleus) at both image and sample levels.
+    Adds AnonCompName and AnonAccNum columns to df and returns the modified DataFrame.
+
+    Outputs:
+      - CellTypePrevalence_{csvname}.png        (Membrane by anonymized CompName)
+      - SampleCellTypePrevalence_{csvname}.png  (Membrane by AccNum)
+      - NucleusTypePrevalence_{csvname}.png     (Nucleus by anonymized CompName)
+      - SampleNucleusTypePrevalence_{csvname}.png (Nucleus by AccNum)
+    """
+    os.makedirs(sdir, exist_ok=True)
+
+    # ---------- Anonymize CompName & AccNum ----------
+    anon_comp, _ = anonymize_compnames(df[comp_col])
+    anon_acc, _ = anonymize_ids(df[acc_col], label_prefix="S")
+
+    df = df.copy()
+    df["AnonCompName"] = anon_comp
+    df["AnonAccNum"] = anon_acc
+
+    # ---------- Ordered category lists ----------
+    ordered_mem_cats = np.load(order_dict_npy,allow_pickle=True)
+    if 'unclassified' not in ordered_mem_cats:
+        ordered_mem_cats = list(ordered_mem_cats)+['unclassified']
+    ordered_mem_cats = [x for x in ordered_mem_cats if 'Nucleus' not in x]
+    print(ordered_mem_cats)
+
+    # ---------- Membrane: by AnonCompName ----------
+    mem_by_img = compute_category_proportions(
+        df.assign(Group=df["AnonCompName"]),
+        group_col="Group",
+        category_col=mem_cat_col,
+        ordered_cats=ordered_mem_cats,
+    )
+    mem_img_colors = resolve_colors_in_order(memcolor_dict, ordered_mem_cats)
+    outfile = os.path.join(sdir, f"CellTypePrevalence_{csvname}.png")
+
+    plt.figure(figsize=(6.5, 4.5), dpi=600)
+    ax = mem_by_img.plot(
+        kind="bar",
+        stacked=True,
+        width=0.9,
+        legend=False,
+        rot=0,
+        ax=plt.gca(),
+    )
+    set_bar_colors(ax, mem_img_colors)
+    ax.set_xlabel("", fontsize=12)
+    ax.set_ylabel("Proportion of Cells", fontsize=12)
+    ax.set_xticklabels(mem_by_img.index.tolist(), fontsize=11, rotation=90)
+    ax.set_yticks([0.0, 0.5, 1.0])
+    ax.tick_params(axis="y", labelsize=11)
+    ax.set_title("Membrane Type Prevalence")
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=600)
+    plt.close()
+
+    # ---------- Membrane: by AccNum ----------
+    mem_by_sample = compute_category_proportions(
+        df.assign(Group=df[acc_col].astype(str)),
+        group_col="Group",
+        category_col=mem_cat_col,
+        ordered_cats=ordered_mem_cats,
+    )
+    mem_sample_colors = resolve_colors_in_order(memcolor_dict, ordered_mem_cats)
+    outfile = os.path.join(sdir, f"SampleCellTypePrevalence_{csvname}.png")
+
+    plt.figure(figsize=(6.5, 4.5), dpi=600)
+    ax = mem_by_sample.plot(
+        kind="bar",
+        stacked=True,
+        width=0.9,
+        legend=False,
+        rot=0,
+        ax=plt.gca(),
+    )
+    set_bar_colors(ax, mem_sample_colors)
+    ax.set_xlabel("", fontsize=12)
+    ax.set_ylabel("Proportion of Cells", fontsize=16)
+    ax.set_xticklabels(mem_by_sample.index.tolist(), fontsize=14, rotation=90)
+    ax.set_yticks([0.0, 0.5, 1.0])
+    ax.tick_params(axis="y", labelsize=14)
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=600)
+    plt.close()
+
+    # ---------- Nucleus color dict ----------
+    if color_dict_npy is not None:
+        nuccolor_dict = load_nucleus_color_dict(color_dict_npy)
+    else:
+        # If none provided, try to infer from membrane dict keys containing 'Nucleus' (fallback)
+        nuccolor_dict = {k: v for k, v in memcolor_dict.items() if "Nucleus" in k or k == "Nucleus"}
+        '''
+        if "Nucleus" in nuccolor_dict:
+            nuccolor_dict["Generic-Nucleus"] = nuccolor_dict.pop("Nucleus")
+        '''
+    if not nuccolor_dict:
+        raise ValueError("No nucleus color dictionary available. Provide color_dict_npy or include nucleus keys.")
+
+    ordered_nuc_cats = list(nuccolor_dict.keys())
+    # ---------- Nucleus: by AnonCompName (use anonymized label on x-axis) ----------
+    nuc_by_img = compute_category_proportions(
+        df.assign(Group=df["AnonCompName"]),
+        group_col="Group",
+        category_col=nuc_cat_col,
+        ordered_cats=ordered_nuc_cats,
+    )
+    nuc_img_colors = resolve_colors_in_order(nuccolor_dict, nuc_by_img.columns)
+    outfile = os.path.join(sdir, f"NucleusTypePrevalence_{csvname}.png")
+
+    plt.figure(figsize=(6.5, 4.5), dpi=600)
+    ax = nuc_by_img.plot(
+        kind="bar",
+        stacked=True,
+        width=0.9,
+        legend=False,
+        rot=0,
+        ax=plt.gca(),
+    )
+    set_bar_colors(ax, nuc_img_colors)
+    ax.set_xlabel("", fontsize=12)
+    ax.set_ylabel("Proportion of Cells", fontsize=12)
+    ax.set_xticklabels(nuc_by_img.index.tolist(), fontsize=11, rotation=90)
+    ax.set_yticks([0.0, 0.5, 1.0])
+    ax.tick_params(axis="y", labelsize=11)
+    ax.set_title("Nucleus Class Prevalence")
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=600)
+    plt.close()
+
+    # ---------- Nucleus: by AccNum ----------
+    nuc_by_sample = compute_category_proportions(
+        df.assign(Group=df[acc_col].astype(str)),
+        group_col="Group",
+        category_col=nuc_cat_col,
+        ordered_cats=ordered_nuc_cats,
+    )
+    nuc_sample_colors = resolve_colors_in_order(nuccolor_dict, nuc_by_sample.columns)
+    outfile = os.path.join(sdir, f"SampleNucleusTypePrevalence_{csvname}.png")
+
+    plt.figure(figsize=(6.5, 4.5), dpi=600)
+    ax = nuc_by_sample.plot(
+        kind="bar",
+        stacked=True,
+        width=0.9,
+        legend=False,
+        rot=0,
+        ax=plt.gca(),
+    )
+    set_bar_colors(ax, nuc_sample_colors)
+    ax.set_xlabel("", fontsize=12)
+    ax.set_ylabel("Proportion of Cells", fontsize=16)
+    ax.set_xticklabels(nuc_by_sample.index.tolist(), fontsize=14, rotation=90)
+    ax.set_yticks([0.0, 0.5, 1.0])
+    ax.tick_params(axis="y", labelsize=14)
+    plt.tight_layout()
+    plt.savefig(outfile, dpi=600)
+    plt.close()
+
     
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--rootdir',type=str,default='/nfs/kitbag/CellularImageAnalysis/SCAMPI_datasets/',help='')
-    parser.add_argument('--dataset',type=str,default='PSC_CRC',help='')
-    parser.add_argument('--readdir',type=str,default='classify_by_dilation/with-MPI',help='')
+    parser.add_argument('--dataset',type=str,default='BC_CODEX',help='')
+    parser.add_argument('--readdir',type=str,default='classify_by_dilation',help='')
     parser.add_argument('--sample',type=str,default='all_samples',help='')
     parser.add_argument('--area',type=str,default='all_areas',help='')
+    parser.add_argument('--memth',type=float,default=5,help='')
+    parser.add_argument('--nucth',type=float,default=5,help='')
     
     args,unparsed = parser.parse_known_args()
     
     rdir = os.path.join(args.rootdir,args.dataset,args.readdir)
-    sdir = os.path.join(rdir,'Prevalence_Plots_filtered')
+    sdir = os.path.join(rdir,'Prevalence_and_Validation_Plots')
     
     if not os.path.exists(sdir):
         os.makedirs(sdir)
 
-    if (args.sample != 'all_samples') and (args.area !='all_areas'):
-        csv_names = os.listdir(os.path.join(rdir,args.sample,args.area))
-        csv_names = ['/'.join([args.sample,args.area,x]) for x in csv_names]
-        csv_names = [x for x in csv_names if 'cellMPI' not in x]
+    csv_name = 'combined_SAM-scores.csv'
+    csvname = csv_name.replace('.csv','_FinalCats.csv')
+    
+    if not os.path.exists(os.path.join(rdir,'_'.join([args.dataset,'cellMPI','FinalCats.csv']))):
+        if not os.path.exists(os.path.join(rdir,csvname)):
+            SAMdf = pd.read_csv(os.path.join(rdir,csv_name),low_memory=False)
+            SAMdf = SAMdf.fillna(0)
+            SAMdf = filter_cells(SAMdf,args.memth,args.nucth)
+            SAMdf.to_csv(os.path.join(rdir,csvname))
+        else:
+            SAMdf = pd.read_csv(os.path.join(rdir,csvname))
+        mpi_df = pd.read_csv(os.path.join(rdir,'combined_cellMPI.csv'))
+        mpi_df = fix_split_sections(mpi_df)
+        df = SAMdf.merge(mpi_df,on=['FullSection','AdjCellID'])
+        keepcols = [x for x in df.columns if not x.endswith('_y')]
+        renamecols = [x for x in df.columns if x.endswith('_x')]
+        newnames = [x.replace('_x','') for x in renamecols]
+        df=df[keepcols]
+        df[newnames]=df[renamecols]
+        df=df.drop(columns=renamecols)
+        print('SAM df:',SAMdf.shape)
+        print('MPI df:',mpi_df.shape)
+        print('Combined df:',df.shape)
+        df.to_csv(os.path.join(rdir,'_'.join([args.dataset,'cellMPI','FinalCats.csv'])))
     else:
-        csv_names = ['combined_SAM-scores_with-MPI.csv']
-
-    for csv_name in csv_names:
-        csvname=csv_name.split('_SAM')[0].split('/')[-1]
+        df = pd.read_csv(os.path.join(rdir,'_'.join([args.dataset,'cellMPI','FinalCats.csv'])))
     
-        df = pd.read_csv(os.path.join(rdir,csv_name))
-        df = filter_cells(df)
-        df.to_csv(os.path.join(rdir,csvname+'_SAM_scores_filtered.csv'))
-        
-        catnames = df['MemCatName']
-        catnames = np.unique(catnames)
+    if 'AccNum' not in df.columns:
+        df['AccNum']=df['Sample']
 
-        memcolor_dict = {}
-    
-        if args.dataset=='PSC_CRC':
-            #PSC panel
-            memcolor_dict={'APC':[155,5,255],'ActivatedCD8T':[10,242,14],'B':[28,25,227],
-                       'CytotoxicT':[6,140,8],'HelperT':[237,14,29],'IL17-HelperT':[166,3,3],
-                       'IL17CD45':[247,7,235],'IgG-Plasma':[9,237,188],'OtherT':[246,250,5],
-                       'OtherCD45':[123,7,116],'Plasma':[10,166,132],'Plasmablast':[45,148,196],
-                       'unclassified':[168,167,165], 'structure':[133,113,60]}
-            mem_names = ['APC','CD8T-Act','B','CD8T','CD4T','IL17+ CD4T','IL17+ Other Immune','IgG+ Plasma',
-                        'Other T','Other Immune','Plasma','Plasmablast','Unclassified','Structural']
-            memname_dict = {ky:mem_names[i] for i,ky in enumerate(list(memcolor_dict.keys()))}
-        else:
-            #kidney panel
-            memcolor_dict={'B':[28,25,227],'B-TRM':[74,131,237],'BowmansCapsule':[117,74,8],'CD4CD8T':[246,250,5],
-                       'CD4T':[237,14,29],'CD4T-ICOS':[166,3,3],'CD4T-ICOSPD1':[245,69,69],'CD4T-PD1':[150,47,47],'CD4T-TRM':[219,116,116],
-                       'CD8T':[10,242,14],'CD8T-Ex':[6,140,8],'CD8T-GZB':[69,153,70],'CD8T-TRM':[98,166,70],
-                       'DistalTubule':[133,113,60],'Endothelial cell':[186,174,141],'GDT':[247,7,235],'HealthyTubule':[176,136,4],'Glom':[148,123,43],
-                       'M2':[71,204,180],'Macrophage-CD14+':[61,245,242],'Macrophage-CD16+':[3,171,168],'Monocyte-GZB':[157,227,245],
-                       'Monocyte-HLAII+':[0,167,245],'Monocyte-HLAII-':[45,148,196],'NK':[236,245,157],'NKT':[245,210,157],'Neutrophils':[237,120,9],
-                       'Plasma':[9,237,188],'Plasma-Act':[10,166,132],'Plasmablast':[59,148,106],'ProximalTubule':[150,142,117],
-                       'cDC1':[155,5,255],'cDC2':[100,32,145],'pDC':[191,121,237],'unclassified':[168,167,165]}
-            
-            mem_names = ['B','TRM B','Stressed Tubule','CD4CD8T','CD4T','ICOS+ CD4T','ICOS+PD1+ CD4T','PD1+ CD4T',
-                         'TRM CD4T','CD8T','Exhausted CD8T','GZM+ CD8T','TRM CD8T','Distal Tubule','Endothelial','\u03B3\u03B4 T',
-                         'Healthy Tubule','Other Glomerulus','CD163+ Macrophage','Other Macrophage','CD16+ Macrophage','GZB+ Monocyte','HLAII+ Monocyte',
-                         'HLAII- Monocyte','NK','NKT','Neutrophil','Plasma','SLAMF7+ Plasma','Plasmablast','Proximal Tubule',
-                         'cDC1','cDC2','pDC','Unclassified']
-            memname_dict = {ky:mem_names[i] for i,ky in enumerate(list(memcolor_dict.keys()))}
-    
-        catnames = df['MemCatName']
-        catnames = np.unique(catnames)
-        catnames.sort()
-
-        cols = df.columns
-        mpicols = [x for x in cols if 'Int-mean' in x]
-        mpidf = df[mpicols]
-        cols = [x for x in cols if 'Int-mean' not in x]
+    color_npy = os.path.join(args.rootdir, args.dataset, "color_dictionary.npy")
+    order_npy = os.path.join(args.rootdir, args.dataset, "cell_class_order.npy")
+    if os.path.exists(color_npy):
+        colordict = np.load(color_npy,allow_pickle=True).item()
+        kys = list(colordict.keys())
+        memkys = [x for x in kys if 'Nucleus' not in x]
+        memcolor_dict = {x:colordict[x] for x in memkys}
+        if 'unclassified' not in memcolor_dict.keys():
+            memcolor_dict.update({'unclassified':[128,128,128]})
+            memkys.append('unclassified')
         
-        df = df[cols]
-        cats = np.unique(df['MemCatName'])
-        samples = np.unique(df['CompName'])
-        
-        #for anonymizing final figs
-        anonsamples = list(samples)
-        usamples = np.unique([x.split('_')[0] for x in anonsamples])
-        for idx,sname in enumerate(usamples):
-            newname = 'S'+str(idx+1)
-            anonsamples = [x.replace(sname,newname) for x in anonsamples]
-        anonsamples = [x.replace('Area','A') for x in anonsamples]
-        cellcts = {}
-        for sample in samples:
-            sdf = df[df['CompName']==sample]
-            cells,_=sdf.shape
-            cellcts.update({sample:cells})
-            
-        if args.dataset=='PSC_CRC':
-            ordered_cats=[x for x in memcolor_dict.keys()]
-        else:
-            ordered_cats = ['BowmansCapsule','DistalTubule','Endothelial cell',
-                            'Glom','HealthyTubule','ProximalTubule',
-                            'B','B-TRM','CD4T','CD4T-ICOS',
-                            'CD4T-ICOSPD1','CD4T-PD1','CD4T-TRM','CD8T','CD8T-Ex',
-                            'CD8T-GZB','CD8T-TRM','NKT','GDT','CD4CD8T','M2','Macrophage-CD14+',
-                            'Macrophage-CD16+','Monocyte-GZB','Monocyte-HLAII+',
-                            'Monocyte-HLAII-','NK','Neutrophils','Plasma',
-                            'Plasma-Act','Plasmablast','cDC1','cDC2','pDC','unclassified']
-        cts = df.groupby('CompName')['MemCat'].count()
-        cell_fractions=pd.DataFrame()
-        for sample in samples:
-            subdf = df[df['CompName']==sample]
-            cat_props={}
-            for cat in ordered_cats:
-                pdf = subdf[subdf['MemCatName']==cat]
-                props = pdf['MemCatName'].count()/subdf.shape[0]
-                cat_props.update({cat:[props]})
-            catdf = pd.DataFrame.from_dict(cat_props)
-            cell_fractions=pd.concat([cell_fractions,catdf],ignore_index=True)
-        ordered_colors = [memcolor_dict[x] for x in ordered_cats if x in cell_fractions.columns]
-        print(cell_fractions)
-        print(cell_fractions[ordered_cats].sum(axis=0))
-        cell_fractions['Bx-Image']=anonsamples
-        cell_fractions['CompName']=samples
-        cell_fractions.plot(kind='bar',x='Bx-Image',stacked=True,width=0.9,
-                            color=[rgb_to_hex(x) for x in ordered_colors],rot=0)
-        #plt.legend(loc='center left',bbox_to_anchor=(1.0,0.5))
-        plt.legend('',frameon=False)
-        plt.ylabel('Proportion of Cells',fontsize=12)
-        plt.xlabel('')
-        plt.xticks(fontsize=11,rotation=0)
-        plt.yticks(ticks=[0,0.5,1.0],fontsize=11)
-        plt.title('Membrane Type Prevalence')
-        plt.tight_layout()
-        plt.savefig(os.path.join(sdir,'CellTypePrevalence_'+csvname+'.png'),dpi=600)
-        #plt.show()
-        plt.close()
-       
-        samples = np.unique(df['Sample'])
-        
-        #for anonymizing final figs
-        anonsamples = list(samples)
-        usamples = np.unique([x.split('_')[0] for x in anonsamples])
-        for idx,sname in enumerate(usamples):
-            newname = 'S'+str(idx+1)
-            anonsamples = [x.replace(sname,newname) for x in anonsamples]
-        cellcts = {}
-        for sample in samples:
-            sdf = df[df['Sample']==sample]
-            cells,_=sdf.shape
-            cellcts.update({sample:cells})
-            
-        cts = df.groupby('Sample')['MemCat'].count()
-        
-        cell_fractions=pd.DataFrame()
-        for sample in samples:
-            subdf = df[df['Sample']==sample]
-            cat_props={}
-            for cat in cats:
-                pdf = subdf[subdf['MemCatName']==cat]
-                props = pdf['MemCatName'].count()/subdf.shape[0]
-                cat_props.update({cat:[props]})
-            catdf = pd.DataFrame.from_dict(cat_props)
-            cell_fractions=pd.concat([cell_fractions,catdf],ignore_index=True)
-        if args.dataset=='PSC_CRC':
-            ordered_cats=[x for x in memcolor_dict.keys()]
-        else:
-            ordered_cats = ['BowmansCapsule','DistalTubule','Endothelial cell',
-                            'Glom','HealthyTubule','ProximalTubule',
-                            'B','B-TRM','CD4T','CD4T-ICOS',
-                            'CD4T-ICOSPD1','CD4T-PD1','CD4T-TRM','CD8T','CD8T-Ex',
-                            'CD8T-GZB','CD8T-TRM','NKT','GDT','CD4CD8T','M2','Macrophage-CD14+',
-                            'Macrophage-CD16+','Monocyte-GZB','Monocyte-HLAII+',
-                            'Monocyte-HLAII-','NK','Neutrophils','Plasma',
-                            'Plasma-Act','Plasmablast','cDC1','cDC2','pDC','unclassified']
-        ordered_colors = [memcolor_dict[x] for x in ordered_cats if x in cell_fractions.columns]
-        cell_fractions['Bx-Image']=anonsamples
-        cell_fractions['Sample']=samples
-        cell_fractions.plot(kind='bar',x='Bx-Image',stacked=True,width=0.9,
-                            color=[rgb_to_hex(x) for x in ordered_colors])
-        #plt.legend(loc='center left',bbox_to_anchor=(1.0,0.5))
-        plt.legend('',frameon=False)
-        plt.ylabel('Proportion of Cells',fontsize=14)
-        plt.xticks(fontsize=12,rotation=0)
-        plt.yticks(ticks=[0,0.5,1.0],fontsize=12)
-        plt.xlabel('')
-        plt.title('Membrane Class Prevalence',fontsize=14)
-        plt.tight_layout()
-        plt.savefig(os.path.join(sdir,'SampleCellTypePrevalence_'+csvname+'.png'),dpi=600)
-        #plt.show()
-        plt.close()
-        
-        ########################       
-        catnames = df['NucCatName']
-        catnames = np.unique(catnames)
-        catnames.sort()
-
-        nuccolor_dict = {}
-    
-        #selected nucleus colors
-        if args.dataset=='PSC_CRC':
-            #PSC panel
-            nuccolor_dict={'Nucleus':[200,200,200],'RegT-Nuc':[135,16,88],'pSTAT3-Nuc':[252,152,3]}
-            nuc_names = ['Nucleus','Foxp3+ Nucleus','pSTAT3+ Nucleus']
-            nucname_dict = {ky:nuc_names[i] for i,ky in enumerate(list(nuccolor_dict.keys()))}
-        else:
-            #kidney panel
-            nuccolor_dict={'Nucleus':[200,200,200],'Nucleus-FoxP3+':[135,16,88],
-                           'Nucleus-Ki67+':[2,94,37],'Nucleus-Tubule':[179,144,4]}
-            nuc_names = ['Nucleus','Foxp3+ Nucleus','Ki67+ Nucleus','Tubule Nucleus']
-            nucname_dict = {ky:nuc_names[i] for i,ky in enumerate(list(nuccolor_dict.keys()))}
-    
-        cats = np.unique(df['NucCatName'])
-
-        samples = np.unique(df['CompName'])
-        cellcts = {}
-        for sample in samples:
-            sdf = df[df['CompName']==sample]
-            cells,_=sdf.shape        
-            cellcts.update({sample:cells})
-            
-        cts = df.groupby('CompName')['NucCat'].count()
-        
-        anonsamples = list(samples)
-        usamples = np.unique([x.split('_')[0] for x in anonsamples])
-        for idx,sname in enumerate(usamples):
-            newname = 'S'+str(idx+1)
-            anonsamples = [x.replace(sname,newname) for x in anonsamples]
-        anonsamples = [x.replace('Area','A') for x in anonsamples]
-        
-        cell_fractions=pd.DataFrame()
-        for sample in samples:
-            subdf = df[df['CompName']==sample]
-            cat_props={}
-            for cat in cats:
-                pdf = subdf[subdf['NucCatName']==cat]
-                props = pdf['NucCatName'].count()/cts[sample]
-                cat_props.update({cat:[props]})
-            catdf = pd.DataFrame.from_dict(cat_props)
-            cell_fractions=pd.concat([cell_fractions,catdf],ignore_index=True)
-
-        ordered_colors = [nuccolor_dict[x] for x in nuccolor_dict.keys() if x in cell_fractions.columns]
-        cell_fractions['Bx-Image']=anonsamples
-        cell_fractions['CompName']=samples
-        cell_fractions.plot(kind='bar',x='Bx-Image',stacked=True,width=0.9,
-                            color=[rgb_to_hex(x) for x in ordered_colors])
-        #plt.legend(loc='center left',bbox_to_anchor=(1.0,0.5))
-        plt.legend('',frameon=False)
-        plt.ylabel('Proportion of Cells',fontsize=12)
-        plt.xlabel('')
-        plt.xticks(fontsize=11,rotation=0)
-        plt.yticks(ticks=[0,0.5,1.0],fontsize=11)
-        plt.title('Nucleus Class Prevalence')
-        plt.tight_layout()
-        plt.savefig(os.path.join(sdir,'NucleusTypePrevalence_'+csvname+'.png'),dpi=600)
-        #plt.show()
-        plt.close()
-        
-        samples = np.unique(df['Sample'])
-        cellcts = {}
-        for sample in samples:
-            sdf = df[df['Sample']==sample]
-            cells,_=sdf.shape        
-            cellcts.update({sample:cells})
-            
-        cts = df.groupby('Sample')['NucCat'].count()
-        
-        anonsamples = list(samples)
-        usamples = np.unique([x.split('_')[0] for x in anonsamples])
-        for idx,sname in enumerate(usamples):
-            newname = 'S'+str(idx+1)
-            anonsamples = [x.replace(sname,newname) for x in anonsamples]
-        
-        cell_fractions=pd.DataFrame()
-        for sample in samples:
-            subdf = df[df['Sample']==sample]
-            cat_props={}
-            for cat in cats:
-                pdf = subdf[subdf['NucCatName']==cat]
-                props = pdf['NucCatName'].count()/cts[sample]
-                cat_props.update({cat:[props]})
-            catdf = pd.DataFrame.from_dict(cat_props)
-            cell_fractions=pd.concat([cell_fractions,catdf],ignore_index=True)
-        
-        ordered_colors = [nuccolor_dict[x] for x in nuccolor_dict.keys() if x in cell_fractions.columns]
-        cell_fractions['Bx-Image']=anonsamples
-        cell_fractions['Sample']=samples
-        cell_fractions.plot(kind='bar',x='Bx-Image',stacked=True,width=0.9,
-                            color=[rgb_to_hex(x) for x in ordered_colors])
-        #plt.legend(loc='center left',bbox_to_anchor=(1.0,0.5))
-        plt.legend('',frameon=False)
-        plt.ylabel('Proportion of Cells',fontsize=14)
-        plt.xticks(fontsize=12,rotation=0)
-        plt.yticks(ticks=[0,0.5,1.0],fontsize=12)
-        plt.xlabel('')
-        plt.title('Nucleus Class Prevalence',fontsize=14)
-        plt.tight_layout()
-        plt.savefig(os.path.join(sdir,'SampleNucleusTypePrevalence_'+csvname+'.png'),dpi=600)
-        #plt.show()
-        plt.close()
-        '''
-        #class matching plots
-        N = list(nuccolor_dict.keys())
-        for n in N:
-            if n not in np.unique(df['NucCatName']):
-                continue
-            ndf = df[df['NucCatName']==n]
-            mcats = ndf.groupby('MemCatName')['MemCat'].count()
-            mcolors = [memcolor_dict[x] for x in mcats.index]
-            mcolors = [[x[0]/255,x[1]/255,x[2]/255] for x in mcolors]
-            plt.pie(mcats,colors=mcolors)
-            plt.title(nucname_dict[n]+'\nN= '+str(ndf.shape[0]),fontsize=9)
-            plt.savefig(os.path.join(sdir,n+'_cellClassDist.png'),dpi=600)
-            #plt.show()
-        
-        M = list(memcolor_dict.keys())
-        for m in M:
-            if m not in np.unique(df['MemCatName']):
-                continue
-            mdf = df[df['MemCatName']==m]
-            ncats = mdf.groupby('NucCatName')['NucCat'].count()
-            ncolors = [nuccolor_dict[x] for x in ncats.index]
-            ncolors = [[x[0]/255,x[1]/255,x[2]/255] for x in ncolors]
-            plt.pie(ncats,colors=ncolors)
-            plt.title(memname_dict[m]+'\nN= '+str(mdf.shape[0]),fontsize=9)
-            plt.savefig(os.path.join(sdir,m+'_cellClassDist.png'),dpi=600)
-            #plt.show()
-        '''
-        
-        nuccats = np.unique(df['NucCatName'])
-        memcats = np.unique(df['MemCatName'])
-        cats = list(memcats)+list(nuccats)
-        
-        mpicols = [x for x in mpicols if ('TAF' not in x) and ('DIC' not in x)]
-        mpicols.sort()
-        for col in mpicols:
-            df[col]=mpidf[col].dropna()
-            df[col+'_Z'] = (mpidf[col]-mpidf[col].mean())/mpidf[col].std()
-        mpi_cols = [x for x in df.columns if 'Int-mean' in x]
-        mpi_cols.sort()
-
-        mu_array = np.zeros([len(memcats)+len(nuccats),len(mpicols)])
-        z_array = np.zeros([len(memcats)+len(nuccats),len(mpicols)])
-        
-        for i,cat in enumerate(memcats):
-            mpi_df = df[df['MemCatName']==cat][mpi_cols]
-            for j,col in enumerate(mpicols):
-                mu = mpi_df[col].dropna().mean()
-                z = mpi_df[col+'_Z'].dropna().mean()
-                mu_array[i,j]=mu
-                z_array[i,j]=z
-        for ii,cat in enumerate(nuccats):
-            idx = ii+i+1
-            mpi_df = df[df['NucCatName']==cat][mpi_cols]
-            for j,col in enumerate(mpicols):
-                mu = np.mean(mpi_df[col])
-                z = mpi_df[col+'_Z'].mean()
-                mu_array[idx,j]=mu
-                z_array[idx,j]=z
+        nuckys = [x for x in kys if 'Nucleus' in x]
+        nuccolor_dict = {x:colordict[x] for x in nuckys}
+        nuckys = ['Generic-Nucleus' if x=='Nucleus' else x for x in nuckys]
+        memname_dict = {x:x for x in memkys}
+        nucname_dict = {ky:ky for ky in nuckys}
+    else:
+        print('Please create a color dictionary and save it as a .npy file. Exiting script.')
  
-        markers = [x.split('_Int')[0] for x in mpicols]
-        plt.figure(figsize=(4,4),dpi=600)
-        plt.imshow(mu_array,cmap='jet')
-        plt.yticks(ticks=np.arange(0,len(cats)),labels=cats,fontsize=5)
-        plt.xticks(ticks=np.arange(0,len(mpicols)),labels=markers,rotation=90,fontsize=5)
-        plt.colorbar()
-        plt.xlabel('Marker',fontsize=8)
-        plt.ylabel('Predicted Cell Class',fontsize=8)
-        plt.tight_layout()
-        plt.savefig(os.path.join(sdir,'MeanMPI-perClass.png'),dpi=600)
-        #plt.show()
-        plt.close()
-        cats = [memname_dict[x] for x in memcats] + [nucname_dict[x] for x in nuccats]
-        
-        if args.dataset=='PSC_CRC':
-            cats = ['APC','GZB+ CD8T cell','B cell','CD8T cell','CD4T cell',
-                    'IL17+ CD4T cell','IL17+ Other Immune cell','IgG+ Plasma cell',
-                    'Other Immune cell','Other T cell','Plasma cell','Plasmablast',
-                    'Structural cell','Unclassified cell','Generic Nucleus',
-                    'Foxp3+ Nucleus','pSTAT3+ Nucleus']
-        else:
-            cats = ['B cell','TRM B cell','Stressed tubule cell','CD4CD8T cell','CD4T cell',
-                    'ICOS+ CD4T cell','ICOS+PD1+ CD4T cell','PD1+ CD4T cell','TRM CD4T cell',
-                    'CD8T cell','Exhausted CD8T cell','GZM+ CD8T cell','TRM CD8T cell',
-                    'Distal tubule cell','Endothelial cell','\u03B3\u03B4 T cell','Glomerular cell',
-                    'Healthy tubule cell','CD163+ Macrophage','Other Macrophage','CD16+ Macrophage',
-                    'GZB+ Monocyte','HLAII+ Monocyte','HLAII- Monocyte','NK cell','NKT cell','Neutrophil',
-                    'Plasma cell','SLAMF7+ Plasma cell','Plasmablast','Proximal tubule cell',
-                    'cDC1','cDC2','pDC','Unclassified cell','Generic Nucleus','Foxp3+ Nucleus',
-                    'Ki67+ Nucleus','Tubule Nucleus']
-            
-        markers = [x.replace('gamma','\u03B3') for x in markers]  
-        markers = [x.replace('delta','\u03B4') for x in markers]
-        import matplotlib as mpl
-        mpl.rcParams['font.size']=8 
-        plt.figure(figsize=(6.5,4.5),dpi=600)
-        plt.imshow(z_array,vmin=-3,vmax=3,cmap='seismic')
-        plt.yticks(ticks=np.arange(0,len(cats)),labels=cats,fontsize=8)
-        plt.xticks(ticks=np.arange(0,len(mpicols)),labels=markers,fontsize=8,rotation=90)
-        plt.colorbar()
-        plt.xlabel('Marker',fontsize=8)
-        plt.ylabel('Predicted Cell or Nucleus Class',fontsize=8)
-        plt.tight_layout()
-        plt.savefig(os.path.join(sdir,'MeanMPIzscore-perClass.png'),dpi=600)
-        #plt.show()
-        plt.close()
-        
+    make_prevalence_plots(
+        df=df,
+        sdir=sdir,
+        csvname=csvname,
+        memcolor_dict=memcolor_dict,
+        color_dict_npy=color_npy,   # or None
+        order_dict_npy=order_npy,   # or None
+    )
+    
+    plot_mpi_by_class(
+        df=df,
+        sdir=sdir,
+        memname_dict=memname_dict,    # or {}
+        nucname_dict=nucname_dict,    # or {}
+    )
+
+      
+    
 if __name__=="__main__":
     main()
