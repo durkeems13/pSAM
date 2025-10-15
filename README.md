@@ -49,17 +49,20 @@ Outputs/Creats: all files above
 ## Database structure
 The database should have the following structure:
 > Dataset
->> reference_spectra.csv #file with expected marker expression in cell classes
->> Corrected_DAPI_composites #folder with DAPI images for cell segmentation
+>> reference_spectra.csv
+>> 
+>> Corrected_DAPI_composites 
 >>> DAPIImage1
 >>> ...
 >>> DAPIImageX
+>>> 
 >> Normalized_composites #folder with all other image channels
 >>> Sample1
 >>>> Area1
 >>>>> Image1
 >>>>> ...
 >>>>> ImageN
+>>>>> 
 >>>> ...
 >>>> AreaM
 >>> ...
