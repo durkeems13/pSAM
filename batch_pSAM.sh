@@ -1,6 +1,8 @@
 export DATASET=$1
 export SAMPLE=${2:-'all_samples'}
 export AREA=${3:-'all_areas'}
+export PXSZ=${4:-'0.1507'}
+export PAD=${5:-'3'}
 
 
 echo ""
@@ -25,7 +27,7 @@ echo "Collecting cell segmentations..."
 source activate cellpose
 python3 cellpose_wholeSlide.py --dataset $DATASET --sample $SAMPLE --area $AREA
 source deactivate
-python3 dilate_nuclear_segmentations-wholeSlide.py --dataset $DATASET --sample $SAMPLE --area $AREA
+python3 dilate_nuclear_segmentations-wholeSlide.py --dataset $DATASET --sample $SAMPLE --area $AREA --pxsz $PXSZ --pad $PAD
 echo ""
 echo "Cell segmentations done."
 
