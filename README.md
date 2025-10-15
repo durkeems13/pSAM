@@ -49,9 +49,8 @@ Outputs/Creats: all files above
 ## Database structure
 The database should have the following structure:
 > Dataset
->> reference_spectra.csv
->> 
->> Corrected_DAPI_composites 
+>> reference_spectra.csv # pseudospectra refs
+>> Corrected_DAPI_composites # DAPI images
 >>> DAPIImage1
 >>> ...
 >>> DAPIImageX
@@ -62,10 +61,7 @@ The database should have the following structure:
 >>>>> Image1
 >>>>> ...
 >>>>> ImageN
->>>>> 
->>>> ...
 >>>> AreaM
->>> ...
 >>> SampleK
 
 ## File naming
